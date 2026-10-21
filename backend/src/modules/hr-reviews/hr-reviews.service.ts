@@ -1,0 +1,339 @@
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { ReviewCycleStatus, ReviewRecordStatus } from 'common/enum/hr-review.enum';
+import type { IUser } from 'common/types/user.interface';
+import { DataSource, Repository } from 'typeorm';
+import { RewardRuleService } from './reward-rule.service';
+import { HrWalletsService } from '../hr-wallets/hr-wallets.service';
+import { CreateReviewCycleDto } from './dto/create-review-cycle.dto';
+import { GetReviewRecordsDto } from './dto/get-review-records.dto';
+import { UpdateReviewScoreDto } from './dto/update-review-score.dto';
+import { UpdateReviewStatusDto } from './dto/update-review-status.dto';
+import { ReviewCycle } from './entities/review-cycle.entity';
+import { ReviewRecord } from './entities/review-record.entity';
+
+/**
+ * HrReviewsService — chứa toàn bộ business logic cho phân hệ đánh giá HR.
+ * Controller gọi service, service thao tác trực tiếp với Repository (không có lớp Repository tách biệt).
+ */
+@Injectable()
+export class HrReviewsService {
+  constructor(
+    @InjectRepository(ReviewCycle)
+    private readonly reviewCycleRepository: Repository<ReviewCycle>,
+
+    @InjectRepository(ReviewRecord)
+    private readonly reviewRecordRepository: Repository<ReviewRecord>,
+
+    private readonly dataSource: DataSource,
+    private readonly rewardRuleService: RewardRuleService,
+    private readonly hrWalletsService: HrWalletsService,
+  ) { }
+
+  /**
+   * Lấy danh sách Review Records với phân trang và bộ lọc tùy chọn.
+   * Trả về format chuẩn theo guidelines: { meta: { currentPage, pageSize, pages, total }, result }
+   */
+  async findAllRecords(query: GetReviewRecordsDto) {
+    const { page = 1, limit = 10, departmentId, status } = query;
+    const skip = (page - 1) * limit;
+
+    const qb = this.reviewRecordRepository
+      .createQueryBuilder('record')
+      // Join với employee (User) để lấy thông tin nhân viên
+      .leftJoinAndSelect('record.employee', 'employee')
+      // Join với role của employee để có thể filter theo departmentId
+      .leftJoinAndSelect('employee.role', 'role')
+      // Join với reviewCycle để lấy thông tin chu kỳ
+      .leftJoinAndSelect('record.reviewCycle', 'reviewCycle')
+      // Chỉ lấy các record chưa bị soft-delete
+      .where('record.isDeleted = :isDeleted', { isDeleted: false });
+
+    // Áp dụng bộ lọc theo status nếu có
+    if (status) {
+      qb.andWhere('record.status = :status', { status });
+    }
+
+    // Áp dụng bộ lọc theo departmentId (role_id của nhân viên) nếu có
+    if (departmentId) {
+      qb.andWhere('role.id = :departmentId', { departmentId });
+    }
+
+    // Sắp xếp theo thời gian tạo mới nhất
+    qb.orderBy('record.createdAt', 'DESC');
+
+    // Đếm tổng và lấy dữ liệu phân trang
+    const [result, total] = await qb.skip(skip).take(limit).getManyAndCount();
+
+    return {
+      meta: {
+        currentPage: page,
+        pageSize: limit,
+        pages: Math.ceil(total / limit),
+        total,
+      },
+      result,
+    };
+  }
+
+  /**
+   * Tạo mới một Review Cycle với trạng thái mặc định DRAFT.
+   * Validate logic nghiệp vụ: endDate phải sau startDate.
+   */
+  async createCycle(dto: CreateReviewCycleDto, user: IUser): Promise<ReviewCycle> {
+    const start = new Date(dto.startDate);
+    const end = new Date(dto.endDate);
+
+    if (end <= start) {
+      throw new BadRequestException('endDate phải sau startDate');
+    }
+
+    const auditUser = { id: user?.id ?? '', email: user?.email ?? '' };
+
+    // 1. Tạo và lưu ReviewCycle
+    const cycle = this.reviewCycleRepository.create({
+      name: dto.name,
+      startDate: start,
+      endDate: end,
+      status: ReviewCycleStatus.DRAFT,
+      createdBy: auditUser,
+      updatedBy: auditUser,
+    });
+
+    const savedCycle = await this.reviewCycleRepository.save(cycle);
+
+    // 2. Nếu có employeeIds, tự động tạo ReviewRecord PENDING cho từng nhân viên
+    if (dto.employeeIds && dto.employeeIds.length > 0) {
+      const records = dto.employeeIds.map((empId) =>
+        this.reviewRecordRepository.create({
+          // TypeORM chấp nhận relation partial { id } — không cần fetch full entity
+          employee: { id: empId } as any,
+          reviewCycle: savedCycle,
+          status: ReviewRecordStatus.PENDING,
+          createdBy: auditUser,
+          updatedBy: auditUser,
+        }),
+      );
+
+      // Bulk-save toàn bộ records trong một lần gọi DB
+      await this.reviewRecordRepository.save(records);
+    }
+
+    return savedCycle;
+  }
+
+  /**
+   * Trả về số liệu tổng hợp của toàn bộ Review Records (không phân trang).
+   * Dùng Promise.all để chạy 4 query COUNT song song, tối ưu performance.
+   */
+  async getRecordStats(): Promise<{
+    total: number;
+    pending: number;
+    inReview: number;
+    completed: number;
+  }> {
+    const baseWhere = { isDeleted: false };
+
+    const [total, pending, inReview, completed] = await Promise.all([
+      this.reviewRecordRepository.count({ where: baseWhere }),
+      this.reviewRecordRepository.count({
+        where: { ...baseWhere, status: ReviewRecordStatus.PENDING },
+      }),
+      this.reviewRecordRepository.count({
+        where: { ...baseWhere, status: ReviewRecordStatus.IN_REVIEW },
+      }),
+      this.reviewRecordRepository.count({
+        where: { ...baseWhere, status: ReviewRecordStatus.COMPLETED },
+      }),
+    ]);
+
+    return { total, pending, inReview, completed };
+  }
+
+  /**
+   * Lấy chi tiết một Review Record theo ID, bao gồm đầy đủ relations:
+   * employee (và role của employee), reviewCycle.
+   * Throw NotFoundException nếu record không tồn tại hoặc đã bị xóa mềm.
+   */
+  async getRecordById(id: string): Promise<ReviewRecord> {
+    const record = await this.reviewRecordRepository
+      .createQueryBuilder('record')
+      .leftJoinAndSelect('record.employee', 'employee')
+      .leftJoinAndSelect('employee.role', 'role')
+      .leftJoinAndSelect('record.reviewCycle', 'reviewCycle')
+      .where('record.id = :id', { id })
+      .andWhere('record.isDeleted = :isDeleted', { isDeleted: false })
+      .getOne();
+
+    if (!record) {
+      throw new NotFoundException(`Review record with id "${id}" not found`);
+    }
+
+    return record;
+  }
+
+  /**
+   * Cập nhật trạng thái và điểm số của một Review Record cụ thể.
+   * Throw NotFoundException nếu không tìm thấy record.
+   * Tự động cập nhật audit field `updatedBy` bằng thông tin user đang đăng nhập.
+   */
+  async updateRecordStatus(
+    id: string,
+    updateDto: UpdateReviewStatusDto,
+    user: IUser,
+  ): Promise<ReviewRecord> {
+    return this.dataSource.transaction(async (manager) => {
+      const recordRepository = manager.getRepository(ReviewRecord);
+      const record = await recordRepository.findOne({
+        where: { id, isDeleted: false },
+        relations: {
+          employee: true,
+          sourceUserSprint: true,
+        },
+        lock: {
+          mode: 'pessimistic_write',
+        },
+      });
+
+      if (!record) {
+        throw new NotFoundException(`Review record with id "${id}" not found`);
+      }
+
+      if (record.status === updateDto.status) {
+        return record;
+      }
+
+      const isValidTransition =
+        (record.status === ReviewRecordStatus.PENDING &&
+          updateDto.status === ReviewRecordStatus.IN_REVIEW) ||
+        (record.status === ReviewRecordStatus.IN_REVIEW &&
+          updateDto.status === ReviewRecordStatus.COMPLETED);
+
+      if (!isValidTransition) {
+        throw new BadRequestException(
+          `Không thể chuyển ReviewRecord từ ${record.status} sang ${updateDto.status}.`,
+        );
+      }
+
+      if (updateDto.status === ReviewRecordStatus.COMPLETED) {
+        this.assertValidCompletionScore(record.tempScore, 'tempScore');
+        this.assertValidCompletionScore(record.finalScore, 'finalScore');
+      }
+
+      record.status = updateDto.status;
+      record.updatedBy = { id: user?.id ?? '', email: user?.email ?? '' };
+      const savedRecord = await recordRepository.save(record);
+
+      if (savedRecord.status === ReviewRecordStatus.COMPLETED) {
+        const amount = this.rewardRuleService.calculateScoreReward(
+          Number(savedRecord.finalScore),
+        );
+
+        if (amount > 0 && savedRecord.employee?.id) {
+          await this.hrWalletsService.processRewardWithManager(
+            savedRecord.employee.id,
+            amount,
+            savedRecord.id,
+            manager,
+            user?.id ?? '',
+          );
+        }
+      }
+
+      return savedRecord;
+    });
+  }
+
+  /**
+   * Cập nhật điểm số của một Review Record (tách biệt với cập nhật trạng thái).
+   * PM có thể nhập tempScore và reviewerNote; HR nhập finalScore.
+   * Throw NotFoundException nếu không tìm thấy record.
+   */
+  async updateRecordScore(
+    id: string,
+    dto: UpdateReviewScoreDto,
+    user: IUser,
+  ): Promise<ReviewRecord> {
+    return this.dataSource.transaction(async (manager) => {
+      const recordRepository = manager.getRepository(ReviewRecord);
+      const record = await recordRepository.findOne({
+        where: { id, isDeleted: false },
+        relations: {
+          sourceUserSprint: true,
+        },
+        lock: {
+          mode: 'pessimistic_write',
+        },
+      });
+
+      if (!record) {
+        throw new NotFoundException(`Review record with id "${id}" not found`);
+      }
+
+      if (record.status === ReviewRecordStatus.COMPLETED) {
+        throw new BadRequestException(
+          'ReviewRecord đã COMPLETED và không thể chỉnh sửa điểm.',
+        );
+      }
+
+      if (
+        record.sourceUserSprintId &&
+        (dto.tempScore !== undefined || dto.reviewerNote !== undefined)
+      ) {
+        throw new BadRequestException(
+          'Không thể ghi đè điểm hoặc nhận xét PM của ReviewRecord nguồn release.',
+        );
+      }
+
+      const incomingTempScore = dto.tempScore;
+      const existingTempScore = record.tempScore;
+      if (dto.finalScore !== undefined) {
+        if (record.status !== ReviewRecordStatus.IN_REVIEW) {
+          throw new BadRequestException(
+            'Chỉ được chốt finalScore khi ReviewRecord đang IN_REVIEW.',
+          );
+        }
+        if (
+          (existingTempScore === null || existingTempScore === undefined) &&
+          (incomingTempScore === null || incomingTempScore === undefined)
+        ) {
+          throw new BadRequestException(
+            'PM chưa đánh giá chuyên môn, hệ thống không cho phép HR chốt điểm cuối cùng.',
+          );
+        }
+      }
+
+      if (dto.tempScore !== undefined) {
+        record.tempScore = dto.tempScore;
+      }
+      if (dto.finalScore !== undefined) {
+        record.finalScore = dto.finalScore;
+      }
+      if (dto.reviewerNote !== undefined) {
+        record.reviewerNote = dto.reviewerNote;
+      }
+
+      record.updatedBy = { id: user?.id ?? '', email: user?.email ?? '' };
+      return recordRepository.save(record);
+    });
+  }
+
+  private assertValidCompletionScore(
+    score: number | null | undefined,
+    fieldName: 'tempScore' | 'finalScore',
+  ): void {
+    const numericScore = Number(score);
+    if (
+      score === null ||
+      score === undefined ||
+      !Number.isFinite(numericScore) ||
+      numericScore < 0 ||
+      numericScore > 100
+    ) {
+      throw new BadRequestException(
+        `${fieldName} hợp lệ trong khoảng 0 đến 100 là bắt buộc để COMPLETED.`,
+      );
+    }
+  }
+
+}
